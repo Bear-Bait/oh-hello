@@ -222,39 +222,55 @@ def change_icon():
     return redirect(url_for('index'))
 
 HTML_TEMPLATE += '''
+                         <div class="bg-white/80 rounded-lg p-4 shadow-lg">
+                        <h3 class="font-bold mb-2">Choose Your Forest Color</h3>
+                        <form action="/change_color" method="POST" class="space-y-4">
+                            <select name="color_name" class="w-full rounded-lg border-gray-300 p-2 mb-4">
+                                {% for category, colors in FOREST_COLORS.items() %}
+                                    <optgroup label="{{ category|title }}">
+                                        {% for color in colors %}
+                                            <option value="{{ color.name }}"
+                                                    {% if current_user.color_name == color.name %}selected{% endif %}
+                                                    style="background-color: {{ color.code }}20">
+                                                {{ color.display }}
+                                            </option>
+                                        {% endfor %}
+                                    </optgroup>
+                                {% endfor %}
+                            </select>
+                            <button type="submit"
+                                class="w-full bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 transition-colors">
+                                Update Color
+                            </button>
+                        </form>
+                    </div>
+
                     <div class="bg-white/80 rounded-lg p-4 shadow-lg">
                         <h3 class="font-bold mb-2">Choose Your Forest Creature</h3>
                         <form action="/change_icon" method="POST" class="space-y-4">
-                            <div class="grid grid-cols-2 gap-2">
-                                {% for icon_id, icon in FOREST_CREATURES.items() %}
-                                <label class="flex flex-col items-center space-y-2 cursor-pointer">
-                                    <input type="radio" name="icon_name" value="{{ icon_id }}"
-                                        {% if current_user.icon_name == icon_id %}checked{% endif %}
-                                        class="hidden peer">
-                                    <div class="relative w-16 h-16 rounded-full overflow-hidden border-4 transition-all duration-300
-                                            peer-checked:border-green-500 hover:border-green-300
-                                            {% if current_user.icon_name == icon_id %}
-                                            border-green-500
-                                            {% else %}
-                                            border-gray-200
-                                            {% endif %}">
-                                        <img src="/media/forest_creatures/{{ icon.file }}"
-                                             alt="{{ icon.display }}"
-                                             class="w-full h-full object-cover">
-                                    </div>
-                                    <span class="text-xs text-center">{{ icon.display }}</span>
-                                </label>
-                                {% endfor %}
+                            <div class="relative">
+                                <select name="icon_name" id="creature-select"
+                                        class="w-full rounded-lg border-gray-300 p-2 pl-12 mb-4">
+                                    {% for icon_id, icon in FOREST_CREATURES.items() %}
+                                        <option value="{{ icon_id }}"
+                                                {% if current_user.icon_name == icon_id %}selected{% endif %}
+                                                data-icon="/media/forest_creatures/{{ icon.file }}">
+                                            {{ icon.display }}
+                                        </option>
+                                    {% endfor %}
+                                </select>
+                                <img id="selected-creature-preview"
+                                     src="/media/forest_creatures/{{ FOREST_CREATURES[current_user.icon_name]['file'] }}"
+                                     class="absolute left-2 top-2 w-8 h-8 rounded-full object-cover"
+                                     alt="Selected creature">
                             </div>
                             <button type="submit"
-                                class="w-full bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">
+                                class="w-full bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 transition-colors">
                                 Update Creature
                             </button>
                         </form>
                     </div>
-                </div>
-
-                <div class="w-3/4">
+                    <div class="w-3/4">
                     <div id="messages" class="message-container overflow-y-auto bg-white/80 p-4 rounded-lg shadow-lg mb-4"></div>
                     <form id="message-form" class="flex gap-2">
                         <select id="recipient" class="w-1/4 rounded border-gray-300 p-2">
@@ -382,20 +398,31 @@ socket.on('connect', function() {
             messages.scrollTop = messages.scrollHeight;
         });
     </script>
+        // Update creature preview when selection changes
+        const creatureSelect = document.getElementById('creature-select');
+        const creaturePreview = document.getElementById('selected-creature-preview');
+        if (creatureSelect && creaturePreview) {
+            creatureSelect.addEventListener('change', function() {
+                const selectedOption = this.options[this.selectedIndex];
+                const iconPath = selectedOption.getAttribute('data-icon');
+                creaturePreview.src = iconPath;
+            });
+        }
+    </script>
     {% endif %}
 </body>
 </html>
 '''
-
 @socketio.on('connect')
-def handle_connect(auth):  # Add auth parameter
+def handle_connect(auth):  # Add auth parameter here
     if 'user' not in session:
         return False
 
-    user = User.query.get(session.get('user', {}).get('id'))
-    if not user:
+    user = User.query.get(session['user']['id'])
+    if not user:  # Add user check
         return False
 
+    user = User.query.get(session['user']['id'])
     connected_bears[request.sid] = {
         'username': user.username,
         'icon': user.icon_path

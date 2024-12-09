@@ -98,7 +98,14 @@ HTML_TEMPLATE = '''
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
     <style>
-        .message-container { height: calc(100vh - 200px); }
+        .message-container {
+            height: 600px;
+        }
+        @media (max-width: 768px) {
+            .message-container {
+                height: 400px;
+            }
+        }
         body {
             background: linear-gradient(rgba(255,255,255,0.9), rgba(255,255,255,0.9));
             background-size: cover;
@@ -345,13 +352,19 @@ HTML_TEMPLATE = '''
             });
         });
 
-        socket.on('system', function(data) {
-            const div = document.createElement('div');
-            div.className = 'message system p-2 text-gray-500 italic';
-            div.textContent = data.message;
-            messages.appendChild(div);
-            messages.scrollTop = messages.scrollHeight;
-        });
+    socket.on('system', function(data) {
+    const div = document.createElement('div');
+    div.className = 'message system p-2 text-gray-500 italic';
+    div.textContent = data.message;
+    messages.appendChild(div);
+    messages.scrollTop = messages.scrollHeight;
+
+    // Handle forced logout
+    if (data.type === 'forced_logout') {
+        socket.disconnect();
+        window.location.href = '/';
+    }
+});
     </script>
     {% endif %}
 </body>
@@ -398,7 +411,6 @@ def register():
     '''
 
 # Part 3: Route Handlers and Socket Events
-
 @app.route('/login', methods=['POST'])
 def login():
     username = request.form.get('username')
@@ -411,12 +423,20 @@ def login():
     user = User.query.filter_by(username=username).first()
     if user and check_password_hash(user.password_hash, password):
         try:
-            # Check for existing active sessions
-            active_session = Session.query.filter_by(user_id=user.id).first()
-            if active_session:
-                flash('User is already logged in. Please log out from other sessions first.')
-                return redirect(url_for('index'))
-            
+            # Terminate existing sessions
+            existing_sessions = Session.query.filter_by(user_id=user.id).all()
+            for existing_session in existing_sessions:
+                if existing_session.socket_id in connected_bears:
+                    # Notify client of forced logout
+                    emit('system', {
+                        'message': 'You have been logged out due to login from another location',
+                        'type': 'forced_logout'
+                    }, room=existing_session.socket_id, namespace='/')
+                    # Disconnect socket
+                    disconnect(existing_session.socket_id, namespace='/')
+                    connected_bears.pop(existing_session.socket_id, None)
+                db.session.delete(existing_session)
+
             # Create new session
             new_session = Session(
                 session_id=os.urandom(24).hex(),
@@ -425,7 +445,14 @@ def login():
             )
             db.session.add(new_session)
             db.session.commit()
-            
+
+            # Update bear count for other users
+            emit('bear_update', {
+                'bears': [{'username': u['username'], 'icon': u['icon']}
+                         for u in connected_bears.values()],
+                'count': len(connected_bears)
+            }, broadcast=True, namespace='/')
+
             # Set session data
             session['user'] = {
                 'id': user.id,
@@ -433,14 +460,16 @@ def login():
                 'session_id': new_session.session_id
             }
             return redirect(url_for('index'))
+
         except Exception as e:
             db.session.rollback()
             flash('An error occurred during login')
             return redirect(url_for('index'))
-    
+
     flash('Invalid username or password')
     return redirect(url_for('index'))
 
+# Modify the logout route to remove the exit message
 @app.route('/logout', methods=['POST'])
 def logout():
     if 'user' not in session:
@@ -454,13 +483,9 @@ def logout():
         ).first()
         
         if active_session:
-            # If there's a socket connection, disconnect it
+            # If there's a socket connection, just remove it
             if active_session.socket_id and active_session.socket_id in connected_bears:
-                user_data = connected_bears.pop(active_session.socket_id)
-                # Emit user left message before removing session
-                emit('system', {
-                    'message': f'{user_data["username"]} left the forest'
-                }, broadcast=True, namespace='/')
+                connected_bears.pop(active_session.socket_id)
             
             db.session.delete(active_session)
             db.session.commit()
@@ -468,7 +493,7 @@ def logout():
         # Clear flask session
         session.pop('user', None)
         
-        # Update bear count for other users
+        # Update bear count for other users without exit message
         emit('bear_update', {
             'bears': [{'username': u['username'], 'icon': u['icon']} 
                      for u in connected_bears.values()],
@@ -481,6 +506,21 @@ def logout():
     
     return redirect(url_for('index'))
 
+@socketio.on('disconnect')
+def handle_disconnect():
+    try:
+        if request.sid in connected_bears:
+            connected_bears.pop(request.sid)
+            
+            # Only emit the updated user list without the exit message
+            emit('bear_update', {
+                'bears': [{'username': u['username'], 'icon': u['icon']}
+                         for u in connected_bears.values()],
+                'count': len(connected_bears)
+            }, broadcast=True)
+    except Exception as e:
+        app.logger.error(f"Socket disconnect error: {e}")
+        
 @app.route('/media/forest_creatures/<path:filename>')
 def serve_forest_creature(filename):
     return send_from_directory('media/forest_creatures', filename)
@@ -524,68 +564,42 @@ def change_icon():
 def handle_connect():
     if 'user' not in session:
         return False
-    
+
     try:
-        # Get active session
         active_session = Session.query.filter_by(
             user_id=session['user']['id'],
             session_id=session['user'].get('session_id')
         ).first()
-        
+
         if not active_session:
             session.pop('user', None)
             return False
-        
-        # Check for existing socket connections for this user
+
         for sid in list(connected_bears.keys()):
             if connected_bears[sid]['username'] == session['user']['username']:
                 connected_bears.pop(sid)
-        
-        # Update session with socket ID
+
         active_session.socket_id = request.sid
         active_session.last_active = datetime.utcnow()
         db.session.commit()
-        
+
         user = User.query.get(session['user']['id'])
         connected_bears[request.sid] = {
             'username': user.username,
             'icon': user.icon_path
         }
-        
-        emit('system', {
-            'message': f'{user.username} joined the forest',
-            'icon': user.icon_path
-        }, broadcast=True)
-        
+
         emit('bear_update', {
-            'bears': [{'username': u['username'], 'icon': u['icon']} 
+            'bears': [{'username': u['username'], 'icon': u['icon']}
                      for u in connected_bears.values()],
             'count': len(connected_bears)
         }, broadcast=True)
-        
+
         return True
-    
+
     except Exception as e:
         app.logger.error(f"Socket connection error: {e}")
         return False
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    try:
-        if request.sid in connected_bears:
-            user_data = connected_bears.pop(request.sid)
-            
-            emit('system', {
-                'message': f'{user_data["username"]} left the forest'
-            }, broadcast=True)
-            
-            emit('bear_update', {
-                'bears': [{'username': u['username'], 'icon': u['icon']}
-                         for u in connected_bears.values()],
-                'count': len(connected_bears)
-            }, broadcast=True)
-    except Exception as e:
-        app.logger.error(f"Socket disconnect error: {e}")
 
 @socketio.on('request_history')
 def handle_history_request():

@@ -685,28 +685,29 @@ def cleanup_old_sessions():
 if __name__ == '__main__':
     # Ensure media directory exists
     os.makedirs('media/forest_creatures', exist_ok=True)
-    
+
     with app.app_context():
         try:
-            # Clean start: drop all tables and recreate
-            db.drop_all()
+            # Only create tables if they don't exist
             db.create_all()
-            print("Database tables created successfully")
-            
-            # Create a test user
-            test_user = User(
-                username="test",
-                password_hash=generate_password_hash("test")
-            )
-            db.session.add(test_user)
-            db.session.commit()
-            print("Test user created (username: test, password: test)")
-            
+            print("Database tables initialized")
+
+            # Optionally create test user only if it doesn't exist
+            test_user = User.query.filter_by(username="test").first()
+            if not test_user:
+                test_user = User(
+                    username="test",
+                    password_hash=generate_password_hash("test")
+                )
+                db.session.add(test_user)
+                db.session.commit()
+                print("Test user created (username: test, password: test)")
+
             # Schedule periodic session cleanup
             def cleanup_task():
                 with app.app_context():
                     cleanup_old_sessions()
-                    
+
             from apscheduler.schedulers.background import BackgroundScheduler
             scheduler = BackgroundScheduler()
             scheduler.add_job(cleanup_task, 'interval', hours=1)

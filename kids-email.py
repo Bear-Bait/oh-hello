@@ -8,8 +8,8 @@ app = Flask(__name__)
 # Configuration
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-GMAIL_ADDRESS = "forrestmuelrath@gmail.com"  # Replace with your Gmail
-APP_PASSWORD = "hvwk eswt yumm rdbe"      # You'll generate this in Gmail settings
+GMAIL_ADDRESS = "ENTER YOUR @gmail.com"  # Replace with your Gmail
+APP_PASSWORD = "YOUR GOOG PASS WORD"      # You'll generate this in Gmail settings
 
 # Simple HTML form template
 HTML_TEMPLATE = """

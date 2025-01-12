@@ -1,21 +1,37 @@
-#Part 1: Core Setup and Models
+# forest_friends_chat.py
 
 from flask import Flask, render_template_string, request, session, redirect, url_for, send_from_directory, flash
 from flask_socketio import SocketIO, emit, disconnect
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from apscheduler.schedulers.background import BackgroundScheduler
 import os
 from datetime import datetime, timedelta
+import mimetypes
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# File upload configurations
+UPLOAD_FOLDER = 'media/attachments'
+ALLOWED_EXTENSIONS = {
+    'image': {'png', 'jpg', 'jpeg', 'gif'},
+    'video': {'mp4', 'webm'},
+    'document': {'txt', 'pdf'}
+}
+MAX_CONTENT_LENGTH = 25 * 1024 * 1024  # 25MB max file size
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
 db = SQLAlchemy(app)
 socketio = SocketIO(app)
 connected_bears = {}
 
+# Forest theme configurations
 FOREST_COLORS = {
     'greens': [
         {'name': 'spring_leaf', 'code': '#8FBC6B', 'display': 'Spring Leaf'},
@@ -40,6 +56,7 @@ FOREST_CREATURES = {
     'owl': {'file': 'owl.png', 'display': 'Wise Owl'}
 }
 
+# Database Models
 class Session(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String(100), unique=True, nullable=False)
@@ -47,7 +64,7 @@ class Session(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_active = db.Column(db.DateTime, default=datetime.utcnow)
     socket_id = db.Column(db.String(100), nullable=True)
-    
+
     user = db.relationship('User', backref='sessions')
 
 class User(db.Model):
@@ -85,8 +102,49 @@ class Message(db.Model):
     recipient = db.Column(db.String(80), nullable=True)
     color_name = db.Column(db.String(30))
     sender_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    
+
     sender = db.relationship('User', backref='messages', foreign_keys=[sender_id])
+
+class FileAttachment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    mime_type = db.Column(db.String(127), nullable=False)
+    file_size = db.Column(db.Integer, nullable=False)
+    upload_date = db.Column(db.DateTime, default=datetime.utcnow)
+    message_id = db.Column(db.Integer, db.ForeignKey('message.id'))
+    uploader_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+
+    message = db.relationship('Message', backref='attachments')
+    uploader = db.relationship('User', backref='uploads')
+
+# Utility Functions
+def allowed_file(filename):
+    """Check if the file extension is allowed"""
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    return any(ext in extensions for extensions in ALLOWED_EXTENSIONS.values())
+
+def get_file_type(filename):
+    """Get the type category of the file"""
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    for file_type, extensions in ALLOWED_EXTENSIONS.items():
+        if ext in extensions:
+            return file_type
+    return None
+
+def cleanup_old_sessions():
+    """Cleanup sessions older than 24 hours"""
+    try:
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        old_sessions = Session.query.filter(Session.last_active < cutoff).all()
+        for old_session in old_sessions:
+            if old_session.socket_id in connected_bears:
+                connected_bears.pop(old_session.socket_id)
+            db.session.delete(old_session)
+        db.session.commit()
+    except Exception as e:
+        app.logger.error(f"Session cleanup error: {e}")
+        db.session.rollback()
 
 # Part 2: HTML Template
 HTML_TEMPLATE = '''
@@ -130,7 +188,7 @@ HTML_TEMPLATE = '''
                 {% endfor %}
             {% endif %}
         {% endwith %}
-        
+
         <div class="relative overflow-hidden bg-green-800 text-white p-4 rounded-lg mb-6">
             <div class="absolute inset-0 pointer-events-none">
                 {% for i in range(5) %}
@@ -154,7 +212,7 @@ HTML_TEMPLATE = '''
                 {% if current_user %}
                 <div class="ml-auto">
                     <form action="/logout" method="POST" class="inline">
-                        <button type="submit" 
+                        <button type="submit"
                                 class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700 transition-colors">
                             Leave Forest
                         </button>
@@ -228,22 +286,35 @@ HTML_TEMPLATE = '''
                     </div>
                 </div>
 
-                <div class="w-3/4">
-                    <div id="messages" class="message-container overflow-y-auto bg-white/80 p-4 rounded-lg shadow-lg mb-4"></div>
-                    <form id="message-form" class="flex gap-2">
-                        <select id="recipient" class="w-1/4 rounded border-gray-300 p-2">
-                            <option value="">Public Message</option>
-                        </select>
-                        <input type="text" id="message-input"
-                            class="flex-1 rounded border-gray-300 p-2"
-                            placeholder="Whisper to the forest..." required>
-                        <button type="submit"
-                            class="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 transition-colors">
-                            Send 🌿
-                        </button>
-                    </form>
-                </div>
-            </div>
+<div class="w-3/4">
+    <div id="messages" class="message-container overflow-y-auto bg-white/80 p-4 rounded-lg shadow-lg mb-4"></div>
+    <form id="message-form" class="flex flex-col gap-2">
+        <div class="flex gap-2">
+            <select id="recipient" class="w-1/4 rounded border-gray-300 p-2">
+                <option value="">Public Message</option>
+            </select>
+            <input type="text" id="message-input"
+                class="flex-1 rounded border-gray-300 p-2"
+                placeholder="Whisper to the forest...">
+            <button type="button" id="attach-button"
+    class="bg-white text-green-800 border border-green-800 px-4 py-2 rounded hover:bg-gray-100 transition-colors">
+            📎
+            </button>
+            <button type="submit"
+                class="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 transition-colors">
+                Send 🌿
+            </button>
+        </div>
+        <input type="file" id="file-input" class="hidden"
+               accept=".txt,.pdf,.png,.jpg,.jpeg,.gif,.mp4,.webm">
+        <div id="attachment-preview" class="hidden p-2 bg-gray-100 rounded flex items-center gap-2">
+            <span id="attachment-name" class="flex-grow"></span>
+            <button type="button" id="remove-attachment"
+                    class="text-red-600 hover:text-red-700">x</button>
+        </div>
+    </form>
+</div>
+
         {% else %}
             <div class="bg-white/80 rounded-lg shadow-lg p-6 max-w-md mx-auto">
                 <h2 class="text-2xl font-bold mb-4">Login to the Forest</h2>
@@ -271,105 +342,197 @@ HTML_TEMPLATE = '''
     </div>
 
     {% if current_user %}
-    <script>
-        const socket = io();
-        const messages = document.getElementById('messages');
-        const messageForm = document.getElementById('message-form');
-        const messageInput = document.getElementById('message-input');
-        const recipientSelect = document.getElementById('recipient');
-        const bearCounter = document.getElementById('bear-counter');
-        const currentUsername = "{{ current_user.username }}";
+<script>
+    const socket = io();
+    const messages = document.getElementById('messages');
+    const messageForm = document.getElementById('message-form');
+    const messageInput = document.getElementById('message-input');
+    const recipientSelect = document.getElementById('recipient');
+    const bearCounter = document.getElementById('bear-counter');
+    const currentUsername = "{{ current_user.username }}";
 
-        socket.on('connect', function() {
-            messages.innerHTML = '';
-            socket.emit('request_history');
-        });
+    // File attachment elements
+    const attachButton = document.getElementById('attach-button');
+    const fileInput = document.getElementById('file-input');
+    const attachmentPreview = document.getElementById('attachment-preview');
+    const attachmentName = document.getElementById('attachment-name');
+    const removeAttachment = document.getElementById('remove-attachment');
+    let currentAttachmentId = null;
 
-        messageForm.onsubmit = function(e) {
-            e.preventDefault();
-            const content = messageInput.value.trim();
-            if (content) {
-                socket.emit('message', {
-                    content: content,
-                    recipient: recipientSelect.value
-                });
-                messageInput.value = '';
-                messageInput.focus();
-            }
-        };
+    // File attachment handlers
+    attachButton.addEventListener('click', () => fileInput.click());
 
-        socket.on('message', function(data) {
-            displayMessage(data);
-        });
+    removeAttachment.addEventListener('click', () => {
+        currentAttachmentId = null;
+        attachmentPreview.classList.add('hidden');
+        fileInput.value = '';
+    });
 
-        socket.on('message_history', function(messages) {
-            messages.reverse().forEach(message => displayMessage(message));
-        });
+    fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
 
-        function displayMessage(data) {
-            const div = document.createElement('div');
-            div.className = `message p-3 mb-2 rounded-lg ${data.private ? 'bg-opacity-75' : ''} transition-all duration-300`;
-            div.style.backgroundColor = `${data.color}15`;
-            div.style.borderLeft = `4px solid ${data.color}`;
-
-            const timestamp = new Date(data.timestamp).toLocaleTimeString();
-            const prefix = data.private ? '(Private) ' : '';
-
-            div.innerHTML = `
-                <div class="flex items-center gap-2">
-                    <img src="${data.icon}" alt="" class="w-8 h-8 rounded-full border-2" 
-                         style="border-color: ${data.color}">
-                    <div class="font-bold" style="color: ${data.color}">${data.sender}</div>
-                </div>
-                <div class="ml-10 text-gray-800">${prefix}${data.content}</div>
-                <div class="ml-10 text-xs text-gray-500">${timestamp}</div>
-            `;
-            messages.appendChild(div);
-            messages.scrollTop = messages.scrollHeight;
+        // Check file size (5MB limit)
+        if (file.size > 25 * 1024 * 1024) {
+            alert('File size must be less than 25MB');
+            fileInput.value = '';
+            return;
         }
 
-        socket.on('bear_update', function(data) {
-            const bearCount = data.count;
-            bearCounter.textContent = `${bearCount} ${bearCount === 1 ? 'Creature' : 'Creatures'} in the Forest`;
+        const formData = new FormData();
+        formData.append('file', file);
 
-            const bearsList = document.getElementById('online-bears');
-            bearsList.innerHTML = data.bears.map(bear => `
-                <li class="flex items-center gap-2 py-1">
-                    <img src="${bear.icon}" alt="" class="w-6 h-6 rounded-full">
-                    <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-                    <span>${bear.username}</span>
-                </li>
-            `).join('');
-
-            recipientSelect.innerHTML = '<option value="">Public Message</option>';
-            data.bears.forEach(bear => {
-                if (bear.username !== currentUsername) {
-                    const option = document.createElement('option');
-                    option.value = bear.username;
-                    option.textContent = `Private to ${bear.username}`;
-                    recipientSelect.appendChild(option);
-                }
+        try {
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
             });
+
+            const result = await response.json();
+
+            if (response.ok) {
+                currentAttachmentId = result.id;
+                attachmentName.textContent = file.name;
+                attachmentPreview.classList.remove('hidden');
+            } else {
+                alert(result.error || 'Upload failed');
+                fileInput.value = '';
+            }
+        } catch (error) {
+            console.error('Upload error:', error);
+            alert('Upload failed');
+            fileInput.value = '';
+        }
+    });
+
+    socket.on('connect', function() {
+        messages.innerHTML = '';
+        socket.emit('request_history');
+    });
+
+    messageForm.onsubmit = function(e) {
+        e.preventDefault();
+        const content = messageInput.value.trim();
+
+        if (content || currentAttachmentId) {
+            socket.emit('message', {
+                content: content,
+                recipient: recipientSelect.value,
+                attachment_id: currentAttachmentId
+            });
+
+            messageInput.value = '';
+            currentAttachmentId = null;
+            attachmentPreview.classList.add('hidden');
+            fileInput.value = '';
+            messageInput.focus();
+        }
+    };
+
+    socket.on('message', function(data) {
+        displayMessage(data);
+    });
+
+    socket.on('message_history', function(messages) {
+        messages.reverse().forEach(message => displayMessage(message));
+    });
+
+    function displayMessage(data) {
+        const div = document.createElement('div');
+        div.className = `message p-3 mb-2 rounded-lg ${data.private ? 'bg-opacity-75' : ''} transition-all duration-300`;
+        div.style.backgroundColor = `${data.color}15`;
+        div.style.borderLeft = `4px solid ${data.color}`;
+
+        const timestamp = new Date(data.timestamp).toLocaleTimeString();
+        const prefix = data.private ? '(Private) ' : '';
+
+        let attachmentHTML = '';
+        if (data.attachment) {
+            const { mime_type, url, filename } = data.attachment;
+
+            if (mime_type.startsWith('image/')) {
+                attachmentHTML = `
+                    <div class="ml-10 mt-2">
+                        <a href="${url}" target="_blank">
+                            <img src="${url}" alt="${filename}" class="max-w-md rounded shadow-sm hover:opacity-90 transition-opacity">
+                        </a>
+                    </div>`;
+            } else if (mime_type.startsWith('video/')) {
+                attachmentHTML = `
+                    <div class="ml-10 mt-2">
+                        <video controls class="max-w-md rounded shadow-sm">
+                            <source src="${url}" type="${mime_type}">
+                            Your browser does not support the video tag.
+                        </video>
+                    </div>`;
+            } else {
+                attachmentHTML = `
+                    <div class="ml-10 mt-2">
+                        <a href="${url}" target="_blank"
+                           class="flex items-center gap-2 text-green-600 hover:text-green-700">
+                            ? ${filename}
+                        </a>
+                    </div>`;
+            }
+        }
+
+        div.innerHTML = `
+            <div class="flex items-center gap-2">
+                <img src="${data.icon}" alt="" class="w-8 h-8 rounded-full border-2"
+                     style="border-color: ${data.color}">
+                <div class="font-bold" style="color: ${data.color}">${data.sender}</div>
+            </div>
+            <div class="ml-10 text-gray-800">${prefix}${data.content}</div>
+            ${attachmentHTML}
+            <div class="ml-10 text-xs text-gray-500">${timestamp}</div>
+        `;
+        messages.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    socket.on('bear_update', function(data) {
+        const bearCount = data.count;
+        bearCounter.textContent = `${bearCount} ${bearCount === 1 ? 'Creature' : 'Creatures'} in the Forest`;
+
+        const bearsList = document.getElementById('online-bears');
+        bearsList.innerHTML = data.bears.map(bear => `
+            <li class="flex items-center gap-2 py-1">
+                <img src="${bear.icon}" alt="" class="w-6 h-6 rounded-full">
+                <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                <span>${bear.username}</span>
+            </li>
+        `).join('');
+
+        recipientSelect.innerHTML = '<option value="">Public Message</option>';
+        data.bears.forEach(bear => {
+            if (bear.username !== currentUsername) {
+                const option = document.createElement('option');
+                option.value = bear.username;
+                option.textContent = `Private to ${bear.username}`;
+                recipientSelect.appendChild(option);
+            }
         });
+    });
 
     socket.on('system', function(data) {
-    const div = document.createElement('div');
-    div.className = 'message system p-2 text-gray-500 italic';
-    div.textContent = data.message;
-    messages.appendChild(div);
-    messages.scrollTop = messages.scrollHeight;
+        const div = document.createElement('div');
+        div.className = 'message system p-2 text-gray-500 italic';
+        div.textContent = data.message;
+        messages.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
 
-    // Handle forced logout
-    if (data.type === 'forced_logout') {
-        socket.disconnect();
-        window.location.href = '/';
-    }
-});
-    </script>
+        if (data.type === 'forced_logout') {
+            socket.disconnect();
+            window.location.href = '/';
+        }
+    });
+</script>
     {% endif %}
 </body>
 </html>
 '''
+
+# Basic route handlers
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE,
@@ -410,7 +573,6 @@ def register():
         </form>
     '''
 
-# Part 3: Route Handlers and Socket Events
 @app.route('/login', methods=['POST'])
 def login():
     username = request.form.get('username')
@@ -446,13 +608,6 @@ def login():
             db.session.add(new_session)
             db.session.commit()
 
-            # Update bear count for other users
-            emit('bear_update', {
-                'bears': [{'username': u['username'], 'icon': u['icon']}
-                         for u in connected_bears.values()],
-                'count': len(connected_bears)
-            }, broadcast=True, namespace='/')
-
             # Set session data
             session['user'] = {
                 'id': user.id,
@@ -469,62 +624,51 @@ def login():
     flash('Invalid username or password')
     return redirect(url_for('index'))
 
-# Modify the logout route to remove the exit message
 @app.route('/logout', methods=['POST'])
 def logout():
     if 'user' not in session:
         return redirect(url_for('index'))
-    
+
     try:
         # Clean up session in database
         active_session = Session.query.filter_by(
             user_id=session['user']['id'],
             session_id=session['user'].get('session_id')
         ).first()
-        
+
         if active_session:
-            # If there's a socket connection, just remove it
             if active_session.socket_id and active_session.socket_id in connected_bears:
                 connected_bears.pop(active_session.socket_id)
-            
+
             db.session.delete(active_session)
             db.session.commit()
-        
-        # Clear flask session
+
         session.pop('user', None)
-        
+
         # Update bear count for other users without exit message
         emit('bear_update', {
-            'bears': [{'username': u['username'], 'icon': u['icon']} 
+            'bears': [{'username': u['username'], 'icon': u['icon']}
                      for u in connected_bears.values()],
             'count': len(connected_bears)
         }, broadcast=True, namespace='/')
-        
+
     except Exception as e:
         db.session.rollback()
         flash('An error occurred during logout')
-    
+
     return redirect(url_for('index'))
 
-@socketio.on('disconnect')
-def handle_disconnect():
-    try:
-        if request.sid in connected_bears:
-            connected_bears.pop(request.sid)
-            
-            # Only emit the updated user list without the exit message
-            emit('bear_update', {
-                'bears': [{'username': u['username'], 'icon': u['icon']}
-                         for u in connected_bears.values()],
-                'count': len(connected_bears)
-            }, broadcast=True)
-    except Exception as e:
-        app.logger.error(f"Socket disconnect error: {e}")
-        
+# Media serving routes
 @app.route('/media/forest_creatures/<path:filename>')
 def serve_forest_creature(filename):
     return send_from_directory('media/forest_creatures', filename)
 
+@app.route('/attachments/<path:filename>')
+def serve_attachment(filename):
+    """Serve uploaded files"""
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# User customization routes
 @app.route('/change_color', methods=['POST'])
 def change_color():
     if 'user' not in session:
@@ -539,7 +683,7 @@ def change_color():
     except Exception as e:
         db.session.rollback()
         flash('An error occurred while updating color')
-    
+
     return redirect(url_for('index'))
 
 @app.route('/change_icon', methods=['POST'])
@@ -557,9 +701,60 @@ def change_icon():
     except Exception as e:
         db.session.rollback()
         flash('An error occurred while updating icon')
-    
+
     return redirect(url_for('index'))
 
+# File upload route
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'user' not in session:
+        return {'error': 'Unauthorized'}, 401
+
+    if 'file' not in request.files:
+        return {'error': 'No file provided'}, 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return {'error': 'No file selected'}, 400
+
+    if not allowed_file(file.filename):
+        return {'error': 'File type not allowed'}, 400
+
+    try:
+        # Generate secure filename and save file
+        filename = secure_filename(file.filename)
+        unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+
+        # Ensure upload directory exists
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+        # Save the file
+        file.save(file_path)
+
+        # Create file attachment record
+        attachment = FileAttachment(
+            filename=unique_filename,
+            original_filename=filename,
+            mime_type=file.content_type or mimetypes.guess_type(filename)[0],
+            file_size=os.path.getsize(file_path),
+            uploader_id=session['user']['id']
+        )
+        db.session.add(attachment)
+        db.session.commit()
+
+        return {
+            'id': attachment.id,
+            'filename': filename,
+            'mime_type': attachment.mime_type,
+            'file_size': attachment.file_size
+        }
+
+    except Exception as e:
+        db.session.rollback()
+        return {'error': str(e)}, 500
+
+   # Socket.IO event handlers
 @socketio.on('connect')
 def handle_connect():
     if 'user' not in session:
@@ -575,20 +770,24 @@ def handle_connect():
             session.pop('user', None)
             return False
 
+        # Remove any existing connections for this user
         for sid in list(connected_bears.keys()):
             if connected_bears[sid]['username'] == session['user']['username']:
                 connected_bears.pop(sid)
 
+        # Update session with socket ID
         active_session.socket_id = request.sid
         active_session.last_active = datetime.utcnow()
         db.session.commit()
 
+        # Add user to connected bears
         user = User.query.get(session['user']['id'])
         connected_bears[request.sid] = {
             'username': user.username,
             'icon': user.icon_path
         }
 
+        # Broadcast updated bear count
         emit('bear_update', {
             'bears': [{'username': u['username'], 'icon': u['icon']}
                      for u in connected_bears.values()],
@@ -601,22 +800,51 @@ def handle_connect():
         app.logger.error(f"Socket connection error: {e}")
         return False
 
+@socketio.on('disconnect')
+def handle_disconnect():
+    try:
+        if request.sid in connected_bears:
+            connected_bears.pop(request.sid)
+
+            # Only emit the updated user list
+            emit('bear_update', {
+                'bears': [{'username': u['username'], 'icon': u['icon']}
+                         for u in connected_bears.values()],
+                'count': len(connected_bears)
+            }, broadcast=True)
+    except Exception as e:
+        app.logger.error(f"Socket disconnect error: {e}")
+
 @socketio.on('request_history')
 def handle_history_request():
     try:
         messages = Message.query.order_by(Message.timestamp.desc()).limit(50).all()
         history = []
+
         for msg in messages:
             user = User.query.filter_by(username=msg.username).first()
             if user:
-                history.append({
+                message_data = {
                     'sender': msg.username,
                     'content': msg.content,
                     'timestamp': msg.timestamp.isoformat(),
                     'private': msg.is_private,
                     'color': user.color_code,
                     'icon': user.icon_path
-                })
+                }
+
+                # Add attachment info if present
+                if msg.attachments:
+                    attachment = msg.attachments[0]
+                    message_data['attachment'] = {
+                        'filename': attachment.original_filename,
+                        'url': f'/attachments/{attachment.filename}',
+                        'mime_type': attachment.mime_type,
+                        'file_size': attachment.file_size
+                    }
+
+                history.append(message_data)
+
         emit('message_history', history)
     except Exception as e:
         app.logger.error(f"Error fetching message history: {e}")
@@ -625,13 +853,15 @@ def handle_history_request():
 def handle_message(data):
     if 'user' not in session:
         return
-    
+
     try:
         user = User.query.get(session['user']['id'])
         content = data.get('content', '').strip()
         recipient_username = data.get('recipient', '').strip()
+        attachment_id = data.get('attachment_id')
 
-        if not content:
+        # Require either content or attachment
+        if not content and not attachment_id:
             return
 
         message = Message(
@@ -643,6 +873,13 @@ def handle_message(data):
             sender_id=user.id
         )
         db.session.add(message)
+
+        # Link attachment to message if present
+        if attachment_id:
+            attachment = FileAttachment.query.get(attachment_id)
+            if attachment and attachment.uploader_id == user.id:
+                attachment.message_id = message.id
+
         db.session.commit()
 
         message_data = {
@@ -654,45 +891,42 @@ def handle_message(data):
             'icon': user.icon_path
         }
 
+        # Add attachment info if present
+        if attachment_id and message.attachments:
+            attachment = message.attachments[0]
+            message_data['attachment'] = {
+                'filename': attachment.original_filename,
+                'url': f'/attachments/{attachment.filename}',
+                'mime_type': attachment.mime_type,
+                'file_size': attachment.file_size
+            }
+
         if recipient_username:
-            # Send to recipient and sender only
+            # Send private message to recipient and sender only
             for sid, connected_user in connected_bears.items():
                 if connected_user['username'] in [recipient_username, user.username]:
                     emit('message', message_data, room=sid)
         else:
+            # Broadcast public message to everyone
             emit('message', message_data, broadcast=True)
-            
+
     except Exception as e:
         app.logger.error(f"Error handling message: {e}")
         db.session.rollback()
 
-# Part 4: Initialization and Cleanup
-
-def cleanup_old_sessions():
-    """Cleanup sessions older than 24 hours"""
-    try:
-        cutoff = datetime.utcnow() - timedelta(hours=24)
-        old_sessions = Session.query.filter(Session.last_active < cutoff).all()
-        for old_session in old_sessions:
-            if old_session.socket_id in connected_bears:
-                connected_bears.pop(old_session.socket_id)
-            db.session.delete(old_session)
-        db.session.commit()
-    except Exception as e:
-        app.logger.error(f"Session cleanup error: {e}")
-        db.session.rollback()
-
+ # Application initialization
 if __name__ == '__main__':
-    # Ensure media directory exists
+    # Ensure media directories exist
     os.makedirs('media/forest_creatures', exist_ok=True)
+    os.makedirs('media/attachments', exist_ok=True)
 
     with app.app_context():
         try:
-            # Only create tables if they don't exist
+            # Initialize database
             db.create_all()
             print("Database tables initialized")
 
-            # Optionally create test user only if it doesn't exist
+            # Create test user if it doesn't exist
             test_user = User.query.filter_by(username="test").first()
             if not test_user:
                 test_user = User(
@@ -703,18 +937,20 @@ if __name__ == '__main__':
                 db.session.commit()
                 print("Test user created (username: test, password: test)")
 
-            # Schedule periodic session cleanup
+            # Define cleanup task here, before scheduling it
             def cleanup_task():
                 with app.app_context():
                     cleanup_old_sessions()
 
+            # Schedule periodic session cleanup
             from apscheduler.schedulers.background import BackgroundScheduler
             scheduler = BackgroundScheduler()
             scheduler.add_job(cleanup_task, 'interval', hours=1)
             scheduler.start()
-            
+
         except Exception as e:
             print(f"Error during initialization: {e}")
             raise
 
+    # Start the server
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)

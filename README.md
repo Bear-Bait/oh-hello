@@ -2,7 +2,7 @@
 
 # Oh, Hello! - Forest Friends Chat
 
-A whimsical, real-time chat application with a forest theme where users can interact as woodland creatures. Built with Flask and Socket.IO for seamless real-time communication.
+A real-time chat application with a forest theme where users can interact as woodland creatures. Built with Flask and Socket.IO for seamless real-time communication on private servers and home computing systems. Built with saftey in mind for all ages.
 
 ## Features
 

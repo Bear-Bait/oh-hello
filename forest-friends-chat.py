@@ -9,6 +9,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import os
 from datetime import datetime, timedelta
 import mimetypes
+import pytz
+
+def eastern_now():
+    """Return the current time in Eastern Time Zone"""
+    eastern = pytz.timezone('America/New_York')
+    return datetime.now(eastern)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -61,8 +67,8 @@ class Session(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String(100), unique=True, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_active = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=eastern_now)
+    last_active = db.Column(db.DateTime, default=eastern_now)
     socket_id = db.Column(db.String(100), nullable=True)
 
     user = db.relationship('User', backref='sessions')
@@ -78,7 +84,7 @@ class User(db.Model):
 
     def clear_session(self):
         self.active_session = None
-        self.last_seen = datetime.utcnow()
+        self.last_seen = eastern_now()
         db.session.commit()
 
     @property
@@ -96,7 +102,7 @@ class User(db.Model):
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.String(500), nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=eastern_now)
     username = db.Column(db.String(80), nullable=False)
     is_private = db.Column(db.Boolean, default=False)
     recipient = db.Column(db.String(80), nullable=True)
@@ -111,7 +117,7 @@ class FileAttachment(db.Model):
     original_filename = db.Column(db.String(255), nullable=False)
     mime_type = db.Column(db.String(127), nullable=False)
     file_size = db.Column(db.Integer, nullable=False)
-    upload_date = db.Column(db.DateTime, default=datetime.utcnow)
+    upload_date = db.Column(db.DateTime, default=eastern_now)
     message_id = db.Column(db.Integer, db.ForeignKey('message.id'))
     uploader_id = db.Column(db.Integer, db.ForeignKey('user.id'))
 
@@ -135,7 +141,7 @@ def get_file_type(filename):
 def cleanup_old_sessions():
     """Cleanup sessions older than 24 hours"""
     try:
-        cutoff = datetime.utcnow() - timedelta(hours=24)
+        cutoff = eastern_now() - timedelta(hours=24)
         old_sessions = Session.query.filter(Session.last_active < cutoff).all()
         for old_session in old_sessions:
             if old_session.socket_id in connected_bears:
@@ -443,8 +449,9 @@ HTML_TEMPLATE = '''
         div.style.backgroundColor = `${data.color}15`;
         div.style.borderLeft = `4px solid ${data.color}`;
 
-        const timestamp = new Date(data.timestamp).toLocaleTimeString();
+        const timestamp = new Date(data.timestamp).toLocaleString();
         const prefix = data.private ? '(Private) ' : '';
+
 
         let attachmentHTML = '';
         if (data.attachment) {
@@ -603,7 +610,7 @@ def login():
             new_session = Session(
                 session_id=os.urandom(24).hex(),
                 user_id=user.id,
-                last_active=datetime.utcnow()
+                last_active=eastern_now()
             )
             db.session.add(new_session)
             db.session.commit()
@@ -723,7 +730,7 @@ def upload_file():
     try:
         # Generate secure filename and save file
         filename = secure_filename(file.filename)
-        unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{filename}"
+        unique_filename = f"{eastern_now().strftime('%Y%m%d_%H%M%S')}_{filename}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
 
         # Ensure upload directory exists
@@ -777,7 +784,7 @@ def handle_connect():
 
         # Update session with socket ID
         active_session.socket_id = request.sid
-        active_session.last_active = datetime.utcnow()
+        active_session.last_active = eastern_now()
         db.session.commit()
 
         # Add user to connected bears
